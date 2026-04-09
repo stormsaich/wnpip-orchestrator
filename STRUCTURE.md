@@ -36,9 +36,15 @@ orchestrator/                       ← git repo root
 ├── manage.py
 │   # CLI for operator actions. Not run as a service — run manually.
 │   # Commands:
+│   #   register-site --site-key <key> --website <domain> --display-name <name>
+│   #                 [--listing-url-pattern <regex>]
+│   #     Writes site:config:<site_key> hash + SADD crawl:sites atomically
+│   #   list-sites
+│   #     SMEMBERS crawl:sites + HGETALL site:config per site
+│   #   seed-queue --site <site_key> --file <urls.txt>
+│   #     LPUSH site:seed_queue:<site_key> for each URL in file
 │   #   crawl-now --site <site_key> --url <url> [--notes "reason"]
 │   #   queue-stats [--site <site_key>]
-│   #   list-sites
 │   #   health
 │   # Uses admin.py internally for crawl-now.
 │
@@ -53,12 +59,27 @@ orchestrator/                       ← git repo root
     ├── __init__.py
     │
     ├── base_job.py
-    │   # BaseJob(redis, mongo, config)
+    │   # BaseJob(redis, mongo, config, scheduler)
     │   # All jobs inherit from this
-    │   # Provides: logger, error handling, per-site iteration helper
+    │   # Provides:
+    │   #   - logger, error handling, per-site iteration helper
+    │   #   - _read_overrides() → dict: reads config:orchestrator:overrides each cycle
+    │   #   - _is_enabled(job_name) → bool: checks override enabled flag
+    │   #   - _check_interval_change(job_name, param, current_minutes): reschedules if changed
+    │   #   - _write_status(job_name, result, duration_ms, run_type): writes job status hash
+    │   #   - _publish_event(event_type, job_name, **kwargs): PUBLISH to orchestrator:events
+    │   # run() template:
+    │   #   1. Read overrides
+    │   #   2. Check for manual trigger (RPOP trigger list) → sets run_type = "manual"
+    │   #   3. If no trigger AND not enabled → publish job_skipped, return
+    │   #   4. Check interval change → reschedule APScheduler job if needed
+    │   #   5. SET is_running=1 in status hash, publish job_started
+    │   #   6. Execute job body (implemented by subclass)
+    │   #   7. SET is_running=0, write full status hash, publish job_completed
     │
     ├── recrawl_scheduler.py
     │   # RecrawlSchedulerJob(BaseJob)
+    │   # Interval param: RECRAWL_INTERVAL_MINUTES | Enabled flag: RECRAWL_SCHEDULER_ENABLED
     │   # run() → None
     │   #   For each site_key in crawl:sites:
     │   #     Query crawl_state for listings with next_crawl_at <= now
@@ -67,6 +88,7 @@ orchestrator/                       ← git repo root
     │
     ├── suspect_checker.py
     │   # SuspectCheckerJob(BaseJob)
+    │   # Interval param: SUSPECT_CHECK_INTERVAL_MINUTES | Enabled flag: SUSPECT_CHECKER_ENABLED
     │   # run() → None
     │   #   Find all suspect listings in crawl_state
     │   #   For each: check raw_listings for most recent crawl result
@@ -75,6 +97,7 @@ orchestrator/                       ← git repo root
     │
     ├── archive_checker.py
     │   # ArchiveCheckerJob(BaseJob)
+    │   # Interval param: (daily — no interval override) | Enabled flag: ARCHIVE_CHECKER_ENABLED
     │   # run() → None
     │   #   Find removed listings older than ARCHIVE_AFTER_REMOVED_DAYS
     │   #   Update crawl_state: status=archived, archived_at=now
@@ -83,38 +106,51 @@ orchestrator/                       ← git repo root
     │
     ├── discovery_trigger.py
     │   # DiscoveryTriggerJob(BaseJob)
+    │   # Interval param: DISCOVERY_TRIGGER_INTERVAL_HOURS | Enabled flag: DISCOVERY_TRIGGER_ENABLED
     │   # run() → None
-    │   #   For each site_key:
-    │   #     Check orchestrator:lock:discovery:<site_key>
-    │   #     If not locked: set lock, launch subprocess
-    │   #     If locked: log skip
-    │   # subprocess.Popen(DISCOVERY_COMMAND, env={SITE_KEY: site_key, ...})
+    │   #   For each site_key in crawl:sites:
+    │   #     Attempt SET NX EX on orchestrator:lock:discovery:<site_key> (TTL=3h)
+    │   #     If lock acquired: LPUSH discovery:trigger:<site_key> {site_key, triggered_at}
+    │   #     If lock already held: log skip (discovery still running)
+    │   # The discovery container polls its trigger queue via BRPOP and manages itself
     │
     ├── health_monitor.py
     │   # HealthMonitorJob(BaseJob)
+    │   # Interval param: HEALTH_CHECK_INTERVAL_SECONDS | Enabled flag: HEALTH_MONITOR_ENABLED
     │   # run() → None
     │   #   Check all heartbeat keys
     │   #   Check queue depths
     │   #   Check proxy pool available ratio
     │   #   Check suspect count
     │   #   For each failure: LPUSH alerts:queue <json>
+    │   # WARNING: disabling this job silences all pipeline alerting
     │
-    └── queue_reaper.py
-        # QueueReaperJob(BaseJob)
+    ├── queue_reaper.py
+    │   # QueueReaperJob(BaseJob)
+    │   # Interval param: QUEUE_REAPER_INTERVAL_MINUTES | Enabled flag: QUEUE_REAPER_ENABLED
+    │   # run() → None
+    │   #   For each site_key:
+    │   #     ZRANGEBYSCORE crawl:inflight:<site_key> 0 <stale_threshold_ms>
+    │   #     ZREM from inflight
+    │   #     ZADD back to queue at current timestamp
+    │
+    └── trigger_watcher.py
+        # TriggerWatcherJob — runs every 30 seconds, not configurable, always enabled
+        # Exists solely to ensure manual triggers are acted on promptly regardless of
+        # the target job's scheduled interval (e.g. ArchiveCheckerJob runs daily —
+        # without this, a manual trigger could wait 24 hours)
         # run() → None
-        #   For each site_key:
-        #     ZRANGEBYSCORE crawl:inflight:<site_key> 0 <stale_threshold_ms>
-        #     ZREM from inflight
-        #     ZADD back to queue at current timestamp
+        #   For each job_name in ALL_JOB_NAMES:
+        #     RPOP orchestrator:job:<job_name>:trigger
+        #     If message present: call job.run(run_type="manual") directly
 ```
 
 ## Docker notes
 
-The `orchestrator` image does not contain Scrapy. Discovery is launched via subprocess
-using the `spiders` container image. In Docker Compose, this means the orchestrator
-container calls `docker exec` or a shared socket to launch the discovery container —
-or more simply, the orchestrator writes a signal to Redis that the discovery container
-polls for.
+The `orchestrator` image does not contain Scrapy and has no knowledge of other
+containers. Discovery is triggered exclusively via Redis: the orchestrator writes
+a signal to `discovery:trigger:<site_key>` and the discovery container polls for
+it via `BRPOP`. Each container manages itself based on what it sees in Redis.
 
-See `jobs/discovery_trigger.py` — the trigger mechanism is configurable via
-`DISCOVERY_COMMAND` env var to allow different launch strategies per environment.
+No `docker exec`, Docker socket, or direct service calls are used anywhere in this
+architecture. All inter-service coordination goes through Redis queues and keys.

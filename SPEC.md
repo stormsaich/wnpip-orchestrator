@@ -10,33 +10,123 @@ them without restarting the container.
 
 ```python
 redis.hset("config:orchestrator:current", mapping={
+    # Intervals
     "RECRAWL_INTERVAL_MINUTES":           config.recrawl_interval_minutes,
     "SUSPECT_CHECK_INTERVAL_MINUTES":     config.suspect_check_interval_minutes,
     "HEALTH_CHECK_INTERVAL_SECONDS":      config.health_check_interval_seconds,
     "QUEUE_REAPER_INTERVAL_MINUTES":      config.queue_reaper_interval_minutes,
     "DISCOVERY_TRIGGER_INTERVAL_HOURS":   config.discovery_trigger_interval_hours,
-    "INFLIGHT_TTL_SECONDS":              config.inflight_ttl_seconds,
+    "INFLIGHT_TTL_SECONDS":               config.inflight_ttl_seconds,
     "ARCHIVE_AFTER_REMOVED_DAYS":         config.archive_after_removed_days,
+    # Enabled flags — all jobs start enabled by default
+    "RECRAWL_SCHEDULER_ENABLED":          "1",
+    "SUSPECT_CHECKER_ENABLED":            "1",
+    "ARCHIVE_CHECKER_ENABLED":            "1",
+    "DISCOVERY_TRIGGER_ENABLED":          "1",
+    "HEALTH_MONITOR_ENABLED":             "1",
+    "QUEUE_REAPER_ENABLED":               "1",
 })
 ```
 
 ### Each job cycle
 
-Read `config:orchestrator:overrides` at the start of each scheduled job run and
-use override values where present. APScheduler job intervals are updated if the
-relevant override changes between runs.
+At the start of every job run the orchestrator:
+
+1. Reads `config:orchestrator:overrides` — applies any UI-set values in preference to env-var defaults
+2. Compares effective interval against what APScheduler is currently scheduled at — reschedules via `scheduler.reschedule_job()` if changed
+3. Checks the job's enabled flag — if `0` and no manual trigger is pending, logs "skipped (disabled)" and returns immediately
+4. Checks `orchestrator:job:<name>:trigger` — if a manual trigger message is present, runs regardless of enabled state and tags the run as `"manual"`
 
 ### Tunable parameters
 
-| Parameter | Effect when overridden |
-| --- | --- |
-| `RECRAWL_INTERVAL_MINUTES` | How often RecrawlSchedulerJob runs |
-| `SUSPECT_CHECK_INTERVAL_MINUTES` | How often SuspectCheckerJob runs |
-| `HEALTH_CHECK_INTERVAL_SECONDS` | How often HealthMonitorJob runs |
-| `QUEUE_REAPER_INTERVAL_MINUTES` | How often QueueReaperJob runs |
-| `DISCOVERY_TRIGGER_INTERVAL_HOURS` | How often discovery is triggered |
-| `INFLIGHT_TTL_SECONDS` | Age threshold for reaping stuck inflight items |
-| `ARCHIVE_AFTER_REMOVED_DAYS` | Days removed before ArchiveCheckerJob transitions to archived |
+| Parameter | Type | Effect when overridden |
+| --- | --- | --- |
+| `RECRAWL_INTERVAL_MINUTES` | int | How often RecrawlSchedulerJob runs |
+| `SUSPECT_CHECK_INTERVAL_MINUTES` | int | How often SuspectCheckerJob runs |
+| `HEALTH_CHECK_INTERVAL_SECONDS` | int | How often HealthMonitorJob runs |
+| `QUEUE_REAPER_INTERVAL_MINUTES` | int | How often QueueReaperJob runs |
+| `DISCOVERY_TRIGGER_INTERVAL_HOURS` | int | How often discovery is triggered |
+| `INFLIGHT_TTL_SECONDS` | int | Age threshold for reaping stuck inflight items |
+| `ARCHIVE_AFTER_REMOVED_DAYS` | int | Days removed before ArchiveCheckerJob transitions to archived |
+| `RECRAWL_SCHEDULER_ENABLED` | bool (0/1) | Enable or disable automated RecrawlSchedulerJob runs |
+| `SUSPECT_CHECKER_ENABLED` | bool (0/1) | Enable or disable automated SuspectCheckerJob runs |
+| `ARCHIVE_CHECKER_ENABLED` | bool (0/1) | Enable or disable automated ArchiveCheckerJob runs |
+| `DISCOVERY_TRIGGER_ENABLED` | bool (0/1) | Enable or disable automated DiscoveryTriggerJob runs |
+| `HEALTH_MONITOR_ENABLED` | bool (0/1) | Enable or disable automated HealthMonitorJob runs |
+| `QUEUE_REAPER_ENABLED` | bool (0/1) | Enable or disable automated QueueReaperJob runs |
+
+**Important:** Disabling a job stops automated scheduling only. A disabled job can still be run via manual trigger. Disabling `HEALTH_MONITOR` silences all alerting — this should be a conscious operator action.
+
+---
+
+## Job Control Protocol
+
+### Manual triggers
+
+Each job monitors a Redis List. The UI writes to this list to request an immediate run:
+
+```
+orchestrator:job:recrawl_scheduler:trigger
+orchestrator:job:suspect_checker:trigger
+orchestrator:job:archive_checker:trigger
+orchestrator:job:discovery_trigger:trigger
+orchestrator:job:health_monitor:trigger
+orchestrator:job:queue_reaper:trigger
+```
+
+Trigger message format (JSON):
+```json
+{"requested_by": "ui", "requested_at": "2026-04-09T10:00:00Z"}
+```
+
+The UI writes: `LPUSH orchestrator:job:<name>:trigger <json>`
+
+A dedicated `TriggerWatcherJob` runs every 30 seconds and scans all trigger lists. If a trigger message is found it fires the corresponding job immediately via APScheduler's `scheduler.get_job(<name>).func()` — outside the normal interval. This ensures manual triggers are acted on within 30 seconds regardless of the job's scheduled interval (important for daily jobs like `ArchiveCheckerJob`).
+
+Manual trigger behaviour:
+- Runs even if the job's enabled flag is `0`
+- Consumes the trigger message with `RPOP` before running (idempotent — one trigger = one run)
+- Tags the run as `"manual"` in the status hash and event
+
+### Job status reporting
+
+After every run the orchestrator writes to a per-job status hash:
+
+```
+orchestrator:job:<name>:status  (Hash)
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `last_run_at` | ISO string | Timestamp of most recent run start |
+| `last_run_type` | string | `"scheduled"` or `"manual"` |
+| `last_duration_ms` | int | Wall-clock time for the run |
+| `last_result` | string | `"ok"` or `"error"` |
+| `last_error` | string | Error message if result is `"error"`, else empty string |
+| `next_run_at` | ISO string | Computed from current effective interval |
+| `is_running` | `"0"` / `"1"` | Set to `"1"` at run start, `"0"` at run end |
+| `run_count` | int | Cumulative total runs (scheduled + manual) |
+| `enabled` | `"0"` / `"1"` | Current enabled state (mirrors override or default) |
+
+`is_running` is set before the job body executes and cleared in a `finally` block. The UI uses this to show a running indicator without polling.
+
+### Event pub/sub
+
+The orchestrator publishes to `orchestrator:events` (Redis Pub/Sub channel) on key lifecycle moments. The UI subscribes to receive real-time updates without polling individual status keys.
+
+Event format:
+```json
+{"event": "<event_type>", "job": "<job_name>", "at": "<iso_timestamp>", ...}
+```
+
+| Event type | Additional fields | When published |
+| --- | --- | --- |
+| `job_started` | `run_type` | Job body begins execution |
+| `job_completed` | `result`, `duration_ms` | Job body finishes (ok or error) |
+| `job_skipped` | `reason` (`"disabled"`) | Automated run skipped due to enabled=0 |
+| `job_triggered` | `requested_by` | Manual trigger message consumed |
+| `interval_changed` | `from_minutes`, `to_minutes` | APScheduler rescheduled |
+| `config_applied` | `param`, `value` | Override value applied to a job cycle |
 
 ---
 
@@ -127,21 +217,23 @@ performs the actual document migration to the archive MongoDB.
 
 ### 4. `DiscoveryTriggerJob` — every 4 hours (configurable: `DISCOVERY_TRIGGER_INTERVAL_HOURS`)
 
-**Purpose:** Launch URL discovery runs for each registered site.
+**Purpose:** Signal each registered site's discovery container to run a URL discovery pass.
 
 **Inputs:**
 - Redis `crawl:sites`: set of registered site_keys
 - Redis `orchestrator:lock:discovery:<site_key>`: check for existing lock (prevents overlap)
 
 **Behaviour:**
-- Acquires lock with TTL = 3 hours before launching
-- Launches discovery as a subprocess: `scrapy crawl p24_discovery`
-- If lock already held: skip and log warning
-- If subprocess fails: release lock, push alert to `alerts:queue`
+- For each site_key in `crawl:sites`:
+  - Attempt to acquire `orchestrator:lock:discovery:<site_key>` with TTL = 3 hours (`SET NX EX`)
+  - If lock already held: skip and log — discovery is still running for that site
+  - If lock acquired: `LPUSH discovery:trigger:<site_key>` with a JSON message containing `{site_key, triggered_at}`
+- The discovery container polls `discovery:trigger:<site_key>` via `BRPOP`, runs independently, and deletes the lock when done
+- If the discovery container crashes, the 3-hour lock TTL ensures the next trigger cycle proceeds
 
 **Outputs:**
-- Redis `orchestrator:lock:discovery:<site_key>`: lock set with TTL
-- Subprocess: Scrapy discovery spider (runs independently to completion)
+- Redis `orchestrator:lock:discovery:<site_key>`: lock set with 3-hour TTL
+- Redis `discovery:trigger:<site_key>`: LPUSH trigger message for discovery container
 
 ---
 
@@ -212,11 +304,19 @@ Requests an immediate crawl of a specific URL, bypassing the normal queue priori
 
 | Key | Operation | Notes |
 |---|---|---|
-| `crawl:sites` | SMEMBERS (read) | Enumerate all sites to manage |
+| `crawl:sites` | SMEMBERS (read), SADD (manage.py / UI) | Enumerate all registered site_keys |
+| `site:config:<site_key>` | HGETALL (read), HSET (manage.py / UI) | Site metadata — display name, website, enabled flag |
+| `site:seed_queue:<site_key>` | LPUSH (UI / manage.py), RPOP (orchestrator) | Bulk URL injection queue |
 | `crawl:queue:<site_key>` | ZADD NX, ZADD (admin), ZCARD | Schedule crawls; admin override |
 | `crawl:inflight:<site_key>` | ZRANGEBYSCORE, ZREM | Queue reaper |
 | `crawl:url_map:<site_key>` | HSET | Admin crawl requests |
-| `orchestrator:lock:discovery:<site_key>` | SET EX, GET | Discovery mutex |
+| `discovery:trigger:<site_key>` | LPUSH | Signal discovery container to run |
+| `orchestrator:lock:discovery:<site_key>` | SET NX EX, DEL | Discovery mutex (set by orchestrator, deleted by discovery container on completion) |
+| `orchestrator:job:<name>:trigger` | LPUSH (UI), RPOP (orchestrator) | Manual run trigger per job |
+| `orchestrator:job:<name>:status` | HSET | Job status reported after every run; read by UI |
+| `orchestrator:events` | PUBLISH | Real-time lifecycle events; UI subscribes |
+| `config:orchestrator:current` | HSET (on startup) | Env-var baseline; read by UI for display |
+| `config:orchestrator:overrides` | HGETALL (each cycle) | UI-set overrides; intervals + enabled flags |
 | `health:orchestrator` | SET EX | Self-heartbeat |
 | `health:crawler:<site_key>` | GET | Monitor crawler liveness |
 | `proxy:pool:available` | ZCARD | Health check |
@@ -235,16 +335,77 @@ Requests an immediate crawl of a specific URL, bypassing the normal queue priori
 
 ## Site Registration
 
-Sites are registered in `crawl:sites` (Redis Set). The orchestrator discovers all
-active sites by reading this set on startup and on each job run.
+Sites are registered exclusively through Redis — no hardcoded lists, no config files.
+The orchestrator enumerates `crawl:sites` (Redis Set) on every job cycle and manages
+each site's queue automatically.
 
-To add a new site:
-```
-SADD crawl:sites www_privateproperty_co_za
+### Site registry — `site:config:<site_key>` (Hash)
+
+Every registered site has a config hash as the single source of truth for its metadata:
+
+| Field | Example | Description |
+| --- | --- | --- |
+| `display_name` | `"Property24"` | Human-readable name for the UI |
+| `website` | `"www.property24.com"` | Full domain (used by dedup queries) |
+| `site_key` | `"www_property24_com"` | Redis namespace key |
+| `listing_url_pattern` | `"/(to-rent\|for-sale)/[^/]+/\\d+"` | Regex for identifying listing URLs |
+| `registered_at` | ISO timestamp | When the site was first registered |
+| `enabled` | `"1"` | `"0"` pauses all orchestrator jobs for this site |
+
+### Registering a site
+
+Registration writes to both the config hash and the enumeration set atomically:
+
+```python
+pipe = redis.pipeline()
+pipe.hset(f"site:config:{site_key}", mapping={
+    "display_name":        display_name,
+    "website":             website,
+    "site_key":            site_key,
+    "listing_url_pattern": listing_url_pattern,
+    "registered_at":       datetime.utcnow().isoformat(),
+    "enabled":             "1",
+})
+pipe.sadd("crawl:sites", site_key)
+pipe.execute()
 ```
 
-Once registered, all orchestrator jobs automatically manage that site's queue on
-their next run. No orchestrator code changes required.
+This is exposed via `manage.py register-site` and the UI site management panel.
+Never write `SADD crawl:sites` directly without also writing `site:config:<site_key>`.
+
+### Startup bootstrap
+
+On startup, the orchestrator reads `crawl:sites`. If the set is empty (Redis was
+flushed or a fresh deploy), it logs a CRITICAL alert and continues running — it will
+manage sites as they are registered. It does not seed `crawl:sites` from env vars or
+any other static source.
+
+### Site-level enable/disable
+
+Setting `site:config:<site_key> enabled = "0"` causes all orchestrator jobs to skip
+that site on their next cycle. The site remains registered and its queue is preserved.
+This allows pausing a site's crawl activity without deregistering it.
+
+### Queue seeding — `site:seed_queue:<site_key>` (List)
+
+For bulk URL injection (bootstrapping a new site, recovering from a Redis flush, or
+operator-driven seeding) without running the discovery spider:
+
+```
+LPUSH site:seed_queue:www_property24_com "https://www.property24.com/to-rent/..."
+LPUSH site:seed_queue:www_property24_com "https://www.property24.com/for-sale/..."
+```
+
+The `RecrawlSchedulerJob` drains this list at the start of each cycle:
+
+1. `RPOP site:seed_queue:<site_key>` — up to a configured batch size
+2. Normalise URL, compute `url_hash`
+3. `HSET crawl:url_map:<site_key> <url_hash> <url>` — register in URL map
+4. Upsert `crawl_state` with `listing_status = "discovered"` if not already present
+5. `ZADD NX crawl:queue:<site_key> -1 <url_hash>` — HIGH priority (same as new discovery)
+
+This replaces any need to write directly to `crawl:queue` for bulk operations.
+The UI and `manage.py seed-queue` expose this without operators touching Redis directly.
 
 ---
 
@@ -267,5 +428,7 @@ On `SIGTERM`:
 | MongoDB unavailable at startup | Raise `MongoUnavailableError`, exit with code 1 |
 | Redis unavailable during job | Log error, skip job iteration, retry on next interval |
 | MongoDB unavailable during job | Log error, skip job iteration, retry on next interval |
-| Discovery subprocess fails | Log error, release lock, push alert to `alerts:queue` |
+| Discovery container does not pick up trigger | Lock TTL expires after 3 hours; next trigger cycle proceeds |
 | Job takes longer than interval | APScheduler skips the overlapping run (coalesce=True) |
+| Manual trigger for a long-interval job | TriggerWatcherJob picks it up within 30 seconds regardless of job interval |
+| Job disabled but manual trigger received | TriggerWatcherJob runs the job; enabled flag does not block manual runs |
