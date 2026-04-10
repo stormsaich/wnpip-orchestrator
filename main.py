@@ -48,6 +48,7 @@ def main() -> None:
     redis.hset(
         kb.config_current("orchestrator"),
         mapping={
+            "HEARTBEAT_INTERVAL_SECONDS":        str(config.heartbeat_interval_seconds),
             "RECRAWL_INTERVAL_MINUTES":          str(config.recrawl_interval_minutes),
             "SUSPECT_CHECK_INTERVAL_MINUTES":    str(config.suspect_check_interval_minutes),
             "HEALTH_CHECK_INTERVAL_SECONDS":     str(config.health_check_interval_seconds),
@@ -139,8 +140,8 @@ def main() -> None:
         coalesce=True,
     )
 
-    # Background heartbeat — writes health:orchestrator every 30s
-    heartbeat = Heartbeat(redis, RedisKeyBuilder.health_orchestrator(), interval=30)
+    # Background heartbeat — interval and TTL driven by config
+    heartbeat = Heartbeat(redis, RedisKeyBuilder.health_orchestrator(), interval=config.heartbeat_interval_seconds)
     heartbeat.start()
 
     def shutdown(signum, frame) -> None:
@@ -155,6 +156,7 @@ def main() -> None:
 
     log.info(
         "Orchestrator started. "
+        f"heartbeat={config.heartbeat_interval_seconds}s "
         f"recrawl={config.recrawl_interval_minutes}m "
         f"suspect={config.suspect_check_interval_minutes}m "
         f"health={config.health_check_interval_seconds}s "

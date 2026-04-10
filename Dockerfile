@@ -2,13 +2,15 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Copy shared library first so it can be installed in editable mode
-COPY ../wnpip-shared-libraray /wnpip-shared-libraray
+# Install shared library from local source (checked out as sibling by CI).
+COPY wnpip-shared-libraray/ wnpip-shared-libraray/
+RUN pip install --no-cache-dir ./wnpip-shared-libraray
 
-# Copy orchestrator source
-COPY . /app
-
-# Install dependencies (includes -e ../wnpip-shared-libraray which resolves to /wnpip-shared-libraray)
+# Install remaining dependencies.
+COPY wnpip-orchestrator/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy service source.
+COPY wnpip-orchestrator/ .
 
 CMD ["python", "main.py"]

@@ -4,7 +4,7 @@
     {
       "label": "Create venv",
       "type": "shell",
-      "command": "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
+      "command": "python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt",
       "options": { "cwd": "${workspaceFolder}" },
       "group": "build",
       "presentation": { "reveal": "always", "panel": "shared" }
@@ -12,7 +12,7 @@
     {
       "label": "Install deps",
       "type": "shell",
-      "command": ".venv/bin/pip install -r requirements.txt",
+      "command": ".venv/bin/pip install -r requirements-dev.txt",
       "options": { "cwd": "${workspaceFolder}" },
       "group": "build",
       "presentation": { "reveal": "always", "panel": "shared" }

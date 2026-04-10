@@ -1,0 +1,75 @@
+name: Build & Push Docker Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/wnpip-orchestrator
+
+jobs:
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout wnpip-orchestrator
+        uses: actions/checkout@v4
+        with:
+          path: wnpip-orchestrator
+
+      # Shared library is a sibling repo — checked out alongside wnpip-orchestrator
+      # so the Dockerfile COPY path (wnpip-shared-libraray/) resolves correctly
+      - name: Checkout wnpip-shared-libraray
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/wnpip-shared-libraray
+          path: wnpip-shared-libraray
+          token: ${{ secrets.SHARED_LIB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # branch push → ghcr.io/.../wnpip-orchestrator:main
+            type=ref,event=branch
+            # PR build   → ghcr.io/.../wnpip-orchestrator:pr-42
+            type=ref,event=pr
+            # semver tag → ghcr.io/.../wnpip-orchestrator:1.2.3 + :1.2 + :1
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # always tag latest commit sha
+            type=sha,prefix=sha-
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          # Parent directory is the build context so both repos are in scope
+          context: ${{ github.workspace }}
+          file: wnpip-orchestrator/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
