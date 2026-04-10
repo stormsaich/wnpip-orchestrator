@@ -142,10 +142,10 @@ class HealthMonitorJob(BaseJob):
             if total > 0 and (available / total) < _PROXY_POOL_LOW_RATIO:
                 alerts.append(
                     (
-                        "warning",
+                        "WARNING",
                         "proxy_pool_low",
                         None,
-                        f"{available}/{total} proxies available "
+                        f"Proxy pool low — {available}/{total} proxies available "
                         f"({100 * available / total:.0f}% < {_PROXY_POOL_LOW_RATIO * 100:.0f}%)",
                     )
                 )
@@ -162,17 +162,24 @@ class HealthMonitorJob(BaseJob):
         message: str,
         now: datetime,
     ) -> None:
+        timestamp_ms = int(now.timestamp() * 1000)
+        alert_id = str(uuid.uuid4())
         payload = json.dumps(
             {
+                "id": alert_id,
                 "severity": severity,
                 "service": "orchestrator",
                 "check": check,
                 "site_key": site_key,
                 "message": message,
-                "timestamp": now.isoformat(),
+                # Fields the UI template reads for timestamp display
+                "ts": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "timestamp_ms": timestamp_ms,
             }
         )
         try:
-            self._redis.lpush(RedisKeyBuilder.alerts_queue(), payload)
+            # Write to alerts:history sorted set (score = timestamp_ms)
+            # The UI reads this with ZREVRANGE to get newest-first
+            self._redis.zadd(ALERTS_HISTORY_KEY, {payload: timestamp_ms})
         except Exception as exc:
-            self._log.error(f"Failed to push alert to queue: {exc}")
+            self._log.error(f"Failed to push alert to history: {exc}")
