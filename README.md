@@ -29,6 +29,45 @@ python main.py
 docker compose up orchestrator
 ```
 
+## Docker Compose
+
+Minimal example to run the orchestrator alongside Redis and MongoDB:
+
+```yaml
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+
+  orchestrator:
+    image: ghcr.io/techstormstudios/wnpip-orchestrator:main
+    depends_on:
+      - redis
+      - mongo
+    environment:
+      REDIS_URL: redis://redis:6379
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB: wnpdc
+      LOG_LEVEL: INFO
+      HEARTBEAT_INTERVAL_SECONDS: 5
+      HEALTH_CHECK_INTERVAL_SECONDS: 60
+      RECRAWL_INTERVAL_MINUTES: 5
+      SUSPECT_CHECK_INTERVAL_MINUTES: 15
+      QUEUE_REAPER_INTERVAL_MINUTES: 30
+      DISCOVERY_TRIGGER_INTERVAL_HOURS: 4
+      INFLIGHT_TTL_SECONDS: 300
+      ARCHIVE_AFTER_REMOVED_DAYS: 30
+    restart: unless-stopped
+```
+
+For the full variable reference see `.env.example`.
+
 ## Environment variables
 
 See `.env.example` for the full list with descriptions.
@@ -42,10 +81,10 @@ MONGO_DB
 
 ## Dependencies
 
-- `wnpdcshared` (local install from `../shared`)
+- `wnpip-shared-libraray` (local dev: `requirements-dev.txt`; Docker/CI: copied in by Dockerfile)
 - `apscheduler==3.10.4`
 - `redis==5.0.8`
-- `pymongo[srv]==4.10.1`
+- `pymongo==4.10.1`
 - `python-dotenv==1.0.0`
 
 ## Admin operations
@@ -65,6 +104,6 @@ python manage.py list-sites
 
 ## Observability
 
-- Heartbeat: writes `health:orchestrator` to Redis every 30 seconds (TTL 300s)
-- Alerts: pushes JSON objects to `alerts:queue` in Redis on health check failures
+- Heartbeat: writes `health:orchestrator` to Redis every `HEARTBEAT_INTERVAL_SECONDS` (default 5s, TTL 300s)
+- Alerts: writes JSON objects to `alerts:history` sorted set in Redis on health check failures
 - Logs: structured JSON to stdout, level controlled by `LOG_LEVEL`
