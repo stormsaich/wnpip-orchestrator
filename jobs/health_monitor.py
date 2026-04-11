@@ -64,45 +64,12 @@ class HealthMonitorJob(BaseJob):
     ) -> None:
         kb = RedisKeyBuilder(site_key)
 
-        # Crawler heartbeat
-        hb_raw = self._redis.get(kb.health_crawler())
-        if hb_raw is None:
-            alerts.append(
-                ("CRITICAL", "crawler_heartbeat_missing", site_key, f"Crawler heartbeat missing — no data in Redis for {site_key}")
-            )
-        else:
-            try:
-                hb_dt = datetime.fromisoformat(hb_raw)
-                if hb_dt.tzinfo is None:
-                    hb_dt = hb_dt.replace(tzinfo=timezone.utc)
-                age = (now - hb_dt).total_seconds()
-                if age > _HEARTBEAT_CRITICAL_AGE_SECONDS:
-                    alerts.append(
-                        (
-                            "CRITICAL",
-                            "crawler_heartbeat_stale",
-                            site_key,
-                            f"Crawler heartbeat stale for {site_key} — last seen {age:.0f}s ago (threshold {_HEARTBEAT_CRITICAL_AGE_SECONDS}s)",
-                        )
-                    )
-                elif age > _HEARTBEAT_WARNING_AGE_SECONDS:
-                    alerts.append(
-                        (
-                            "WARNING",
-                            "crawler_heartbeat_stale",
-                            site_key,
-                            f"Crawler heartbeat stale for {site_key} — last seen {age:.0f}s ago (threshold {_HEARTBEAT_WARNING_AGE_SECONDS}s)",
-                        )
-                    )
-            except Exception as exc:
-                alerts.append(
-                    (
-                        "WARNING",
-                        "crawler_heartbeat_parse_error",
-                        site_key,
-                        f"Cannot parse crawler heartbeat for {site_key}: {exc}",
-                    )
-                )
+        # Crawler and discovery heartbeats
+        for service_label, hb_key in (
+            ("crawler", kb.health_crawler()),
+            ("discovery", kb.health_discovery()),
+        ):
+            self._check_heartbeat(service_label, hb_key, site_key, now, alerts)
 
         # Queue depth
         depth = self._redis.zcard(kb.queue())
@@ -132,6 +99,50 @@ class HealthMonitorJob(BaseJob):
                 )
         except Exception as exc:
             self._log.warning(f"[{site_key}] Failed to count suspect listings: {exc}")
+
+    def _check_heartbeat(
+        self,
+        service_label: str,
+        hb_key: str,
+        site_key: str,
+        now: datetime,
+        alerts: list,
+    ) -> None:
+        hb_raw = self._redis.get(hb_key)
+        if hb_raw is None:
+            alerts.append((
+                "CRITICAL",
+                f"{service_label}_heartbeat_missing",
+                site_key,
+                f"{service_label.capitalize()} heartbeat missing — no data in Redis for {site_key}",
+            ))
+            return
+        try:
+            hb_dt = datetime.fromisoformat(hb_raw)
+            if hb_dt.tzinfo is None:
+                hb_dt = hb_dt.replace(tzinfo=timezone.utc)
+            age = (now - hb_dt).total_seconds()
+            if age > _HEARTBEAT_CRITICAL_AGE_SECONDS:
+                alerts.append((
+                    "CRITICAL",
+                    f"{service_label}_heartbeat_stale",
+                    site_key,
+                    f"{service_label.capitalize()} heartbeat stale for {site_key} — last seen {age:.0f}s ago (threshold {_HEARTBEAT_CRITICAL_AGE_SECONDS}s)",
+                ))
+            elif age > _HEARTBEAT_WARNING_AGE_SECONDS:
+                alerts.append((
+                    "WARNING",
+                    f"{service_label}_heartbeat_stale",
+                    site_key,
+                    f"{service_label.capitalize()} heartbeat stale for {site_key} — last seen {age:.0f}s ago (threshold {_HEARTBEAT_WARNING_AGE_SECONDS}s)",
+                ))
+        except Exception as exc:
+            alerts.append((
+                "WARNING",
+                f"{service_label}_heartbeat_parse_error",
+                site_key,
+                f"Cannot parse {service_label} heartbeat for {site_key}: {exc}",
+            ))
 
     # ── Global checks ──────────────────────────────────────────────────────────
 
